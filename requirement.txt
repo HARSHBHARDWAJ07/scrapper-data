@@ -5,3 +5,4 @@ python-dotenv==1.0.0
 colorama==0.4.6
 pyfiglet==0.8.post1
 requests==2.32.0
+setuptools==68.0.0
