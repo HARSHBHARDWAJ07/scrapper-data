@@ -31,13 +31,14 @@ scraping_status: Dict[str, Dict] = {}
 # ----------------------------
 # FASTAPI APP
 # ----------------------------
-app = FastAPI(title="Instagram Tools", version="2.0")
+app = FastAPI(title="Instagram Tools", version="2.1")
 
 # ----------------------------
 # MODELS
 # ----------------------------
 class ScrapeRequest(BaseModel):
     username: str
+    keyword: Optional[str] = None   # NEW: keyword is optional
 
 # ----------------------------
 # HELPERS
@@ -48,10 +49,10 @@ def clear_screen() -> None:
 def show_banner() -> None:
     banner = pyfiglet.Figlet(font='slant', width=300).renderText('IG Tools')
     print(f"{random.choice(COLORS)}{banner}")
-    print(f"{Fore.RED}Instagram Scrapers Suite | Version: 2.0 | Author: Kev\n")
+    print(f"{Fore.RED}Instagram Scrapers Suite | Version: 2.1 | Author: Kev\n")
     print(f"{Fore.LIGHTGREEN_EX}HTTP Server Mode: Active\n")
 
-async def scrape_instagram_posts(username: str) -> List[Dict]:
+async def scrape_instagram_posts(username: str, keyword: Optional[str]) -> List[Dict]:
     """Simulate async scraping"""
     await asyncio.sleep(1)  # simulate network delay
     return [
@@ -63,7 +64,8 @@ async def scrape_instagram_posts(username: str) -> List[Dict]:
             'comments': random.randint(5, 50),
             'hashtags': '#instagram #sample #python',
             'image_url': f'https://example.com/{username}/image_{i}.jpg',
-            'url': f'https://www.instagram.com/p/{username}_{i}/'
+            'url': f'https://www.instagram.com/p/{username}_{i}/',
+            'keyword': keyword or ""   # NEW: include keyword
         }
         for i in range(5)
     ]
@@ -91,10 +93,12 @@ def update_status(req_id: str, status: str, message: str, filename: Optional[str
 @app.post("/scrape_posts")
 async def scrape_posts_endpoint(payload: ScrapeRequest, background_tasks: BackgroundTasks):
     username = payload.username
+    keyword = payload.keyword
     req_id = str(int(time.time()))
 
     scraping_status[req_id] = {
         'username': username,
+        'keyword': keyword,
         'status': 'processing',
         'message': 'Scraping started',
         'filename': None
@@ -102,7 +106,7 @@ async def scrape_posts_endpoint(payload: ScrapeRequest, background_tasks: Backgr
 
     async def task():
         try:
-            posts = await scrape_instagram_posts(username)
+            posts = await scrape_instagram_posts(username, keyword)
             if not posts:
                 update_status(req_id, "error", "No posts found")
                 return
@@ -112,7 +116,11 @@ async def scrape_posts_endpoint(payload: ScrapeRequest, background_tasks: Backgr
             update_status(req_id, "error", str(e))
 
     background_tasks.add_task(task)
-    return {"request_id": req_id, "status": "processing", "message": f"Scraping started for {username}"}
+    return {
+        "request_id": req_id,
+        "status": "processing",
+        "message": f"Scraping started for {username} (keyword: {keyword or 'N/A'})"
+    }
 
 @app.get("/scrape_status/{req_id}")
 async def get_scrape_status(req_id: str):
@@ -130,38 +138,17 @@ async def download_csv(req_id: str):
         raise HTTPException(status_code=400, detail="CSV not ready yet")
     if not status['filename'] or not os.path.exists(status['filename']):
         raise HTTPException(status_code=404, detail="CSV file not found")
-    return FileResponse(status['filename'], media_type="text/csv", filename=f"{status['username']}_posts.csv")
-
-# ----------------------------
-# MAIN MENU (OPTIONAL)
-# ----------------------------
-def main_menu():
-    while True:
-        clear_screen()
-        show_banner()
-        print(f"{Fore.LIGHTGREEN_EX}[1] Session Manager")
-        print("[2] Follower Scraper")
-        print("[3] Following Scraper")
-        print("[4] Post Scraper API (HTTP)")
-        print("[5] Exit")
-        print(f"\n{Fore.CYAN}API: POST /scrape_posts {{'username': 'instagram_username'}}\n")
-
-        choice = input(f"{Fore.LIGHTGREEN_EX}Enter choice: {Fore.RED}").strip()
-        if choice == '4':
-            print(f"\nPost Scraper API → http://localhost:8000")
-            input("\nPress Enter to return...")
-        elif choice == '5':
-            print(f"{Fore.LIGHTGREEN_EX}Goodbye!")
-            sys.exit(0)
-        else:
-            print(f"{Fore.YELLOW}Not implemented yet")
-            time.sleep(1)
+    return FileResponse(
+        status['filename'],
+        media_type="text/csv",
+        filename=f"{status['username']}_posts.csv"
+    )
 
 # ----------------------------
 # ENTRY POINT
 # ----------------------------
 if __name__ == "__main__":
-    # Run FastAPI with uvicorn
     show_banner()
     print(f"{Fore.LIGHTGREEN_EX}[*] Server running at http://localhost:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
+
