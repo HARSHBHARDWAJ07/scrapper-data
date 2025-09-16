@@ -1,228 +1,448 @@
 import os
 import csv
 import io
-import asyncio
-import aiohttp
-import re
+import requests
+import json
+import time
 from datetime import datetime
-from typing import List, Dict
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from typing import List, Dict, Optional
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ----------------------------
-# CONFIGURATION
+# FASTAPI APP
 # ----------------------------
+app = FastAPI(
+    title="Instagram Post Extractor", 
+    version="4.0",
+    description="Extract Instagram posts with title, caption, and hashtags only"
+)
 
-APIFY_TOKEN = os.getenv("APIFY_TOKEN")
-if not APIFY_TOKEN:
-    raise ValueError("Please set APIFY_TOKEN in environment variables (Render dashboard).")
-
-# Correct endpoint: run-sync-get-dataset-items
-BASE_URL = f"https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
-
-app = FastAPI(title="Instagram Scraper API", version="1.0")
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ----------------------------
 # MODELS
 # ----------------------------
-
 class ScrapeRequest(BaseModel):
+    username: str = Field(..., description="Instagram username (without @)")
+    limit: Optional[int] = Field(default=50, ge=1, le=1000, description="Number of posts to extract (1-1000)")
+    extract_all: Optional[bool] = Field(default=False, description="Extract all available posts (ignores limit)")
+
+class PostData(BaseModel):
+    title: str
+    caption: str
+    hashtags: str
+
+class ScrapeResponse(BaseModel):
+    status: str
     username: str
+    total_posts: int
+    extracted_posts: int
+    message: str
 
 # ----------------------------
-# HELPER FUNCTIONS
+# APIFY INSTAGRAM SCRAPER - SIMPLIFIED
 # ----------------------------
-
-def validate_username(username: str) -> bool:
-    """Validate Instagram username format"""
-    # Instagram usernames: 1-30 chars, alphanumeric + dots + underscores, no consecutive dots
-    pattern = r'^[a-zA-Z0-9._]{1,30}$'
-    if not re.match(pattern, username):
-        return False
-    if '..' in username:  # No consecutive dots
-        return False
-    return True
-
-def handle_apify_response(response_data) -> List[Dict]:
-    """Handle Apify API response and check for errors"""
-    # If response is a list, check for error objects
-    if isinstance(response_data, list):
-        if len(response_data) == 0:
-            raise HTTPException(status_code=404, detail="No posts found - account may be private, doesn't exist, or has no posts")
+class InstagramPostExtractor:
+    def __init__(self, apify_token: str):
+        self.apify_token = apify_token
+        self.base_url = "https://api.apify.com/v2"
+        self.actor_id = "apify/instagram-scraper"
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {self.apify_token}",
+            "Content-Type": "application/json"
+        })
         
-        # Check if first item is an error object
-        first_item = response_data[0]
-        if isinstance(first_item, dict) and "error" in first_item:
-            error_type = first_item.get("error", "unknown")
-            error_desc = first_item.get("errorDescription", "Unknown error occurred")
+    def extract_posts(
+        self, 
+        username: str, 
+        limit: int = 50,
+        extract_all: bool = False
+    ) -> List[Dict]:
+        """
+        Extract Instagram posts with only essential data: title, caption, hashtags
+        """
+        
+        # Clean username
+        username = username.replace("@", "").strip().lower()
+        
+        # Set limit - if extract_all is True, set high limit
+        actual_limit = 10000 if extract_all else limit
+        
+        # Simplified configuration - only extract what we need
+        run_input = {
+            "directUrls": [f"https://www.instagram.com/{username}/"],
+            "resultsType": "posts",
+            "resultsLimit": actual_limit,
+            "searchType": "hashtag",
+            "searchLimit": 1,
+            "addParentData": False,
+            "enhanceUserSearchWithFacebookPage": False,
+            "likedByLimit": 0,
+            "includeLocationInfo": False,
+            "commentsLimit": 0,  # No comments needed
+            "extendOutputFunction": "",
+            "extendScraperFunction": "",
+            "customData": {},
+            "proxy": {
+                "useApifyProxy": True,
+                "apifyProxyGroups": ["RESIDENTIAL"]
+            }
+        }
+        
+        logger.info(f"🚀 Extracting posts for @{username} {'(ALL POSTS)' if extract_all else f'(Limit: {limit})'}")
+        start_time = time.time()
+        
+        try:
+            # Start the extraction
+            run_url = f"{self.base_url}/acts/{self.actor_id}/runs"
             
-            if error_type == "no_items":
-                raise HTTPException(
-                    status_code=404, 
-                    detail="Account not found, is private, or has no posts available"
-                )
-            else:
+            response = self.session.post(run_url, json=run_input, timeout=30)
+            
+            if response.status_code != 201:
+                logger.error(f"Failed to start extraction: {response.status_code} - {response.text}")
                 raise HTTPException(
                     status_code=500, 
-                    detail=f"Scraping failed: {error_desc}"
+                    detail=f"Failed to start extraction: {response.text}"
                 )
+            
+            run_data = response.json()
+            run_id = run_data["data"]["id"]
+            logger.info(f"⏳ Extraction started. Run ID: {run_id}")
+            
+            # Wait for completion and get results
+            results = self._wait_for_results(run_id, extract_all)
+            
+            end_time = time.time()
+            logger.info(f"✅ Extraction completed in {end_time - start_time:.2f} seconds")
+            logger.info(f"📊 Extracted {len(results)} posts")
+            
+            return results
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error during extraction: {e}")
+            raise HTTPException(status_code=500, detail=f"Network error: {str(e)}")
+        except Exception as e:
+            logger.error(f"Unexpected error during extraction: {e}")
+            raise HTTPException(status_code=500, detail=f"Extraction error: {str(e)}")
     
-    # If response is a dict, it might be an error response
-    elif isinstance(response_data, dict):
-        if "error" in response_data:
-            error_msg = response_data.get("error", {}).get("message", "Unknown API error")
-            raise HTTPException(status_code=500, detail=f"API Error: {error_msg}")
+    def _wait_for_results(self, run_id: str, extract_all: bool = False) -> List[Dict]:
+        """Wait for extraction to complete and return results"""
         
-        # If it's a dict but not an error, it might be wrapped data
-        if "items" in response_data:
-            return response_data["items"]
+        status_url = f"{self.base_url}/actor-runs/{run_id}"
+        dataset_url = f"{self.base_url}/actor-runs/{run_id}/dataset/items"
+        
+        # Longer timeout for extract_all option
+        max_wait_time = 600 if extract_all else 300
+        start_wait_time = time.time()
+        
+        # Poll for completion with timeout
+        while time.time() - start_wait_time < max_wait_time:
+            try:
+                response = self.session.get(status_url, timeout=30)
+                
+                if response.status_code != 200:
+                    logger.warning(f"Status check failed: {response.status_code}")
+                    time.sleep(5)
+                    continue
+                
+                status_data = response.json()
+                status = status_data["data"]["status"]
+                
+                if status == "SUCCEEDED":
+                    logger.info("✅ Extraction completed successfully")
+                    break
+                elif status == "FAILED":
+                    error_msg = status_data["data"].get("statusMessage", "Unknown error")
+                    logger.error(f"Extraction failed: {error_msg}")
+                    raise HTTPException(status_code=500, detail=f"Extraction failed: {error_msg}")
+                elif status in ["RUNNING", "READY"]:
+                    logger.info(f"⏳ Status: {status}...")
+                    time.sleep(15 if extract_all else 10)
+                else:
+                    logger.info(f"🔄 Status: {status}")
+                    time.sleep(5)
+                    
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Network error during status check: {e}")
+                time.sleep(10)
+                continue
         else:
-            raise HTTPException(status_code=500, detail="Unexpected response format from scraper")
-    
-    else:
-        raise HTTPException(status_code=500, detail="Invalid response format from scraper")
-    
-    return response_data
-
-# ----------------------------
-# SCRAPER
-# ----------------------------
-
-async def scrape_user_posts(username: str, max_posts: int = 30) -> List[Dict]:
-    """Scrape Instagram posts for a specific user from Apify actor"""
-    
-    # Validate username format
-    if not validate_username(username):
-        raise HTTPException(
-            status_code=400, 
-            detail="Invalid username format. Username should contain only letters, numbers, dots, and underscores (1-30 characters)"
-        )
-    
-    # Use directUrls instead of usernames - this is the key fix!
-    instagram_url = f"https://www.instagram.com/{username}/"
-    
-    run_input = {
-        "directUrls": [instagram_url],
-        "resultsType": "posts",
-        "resultsLimit": max_posts,
-        "searchType": "user",
-        "searchLimit": 1,
-        "addParentData": False,
-        "enhanceUserSearchWithFacebookPage": False,
-        "includeHasStories": False,
-        "extendOutputFunction": "($) => {\n  const caption = $.caption || \"\";\n  const hashtags = caption.match(/#\\w+/g) || [];\n  const comments = ($.latestComments || []).map(c => c.text);\n  return {\n    postTitle: $.title || caption.split(\" \")[0] || \"\",\n    caption,\n    hashtags,\n    comments\n  };\n}",
-        "extendScraperFunction": "async ({ page, request, customData, Apify, signal, label }) => {}",
-        "customData": {},
-        "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
-    }
-
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
-            async with session.post(BASE_URL, json=run_input) as resp:
-                # Accept both 200 and 201 as success codes
-                if resp.status not in [200, 201]:
-                    error_text = await resp.text()
-                    raise HTTPException(
-                        status_code=500, 
-                        detail=f"Apify API returned status {resp.status}: {error_text}"
-                    )
-                
-                try:
-                    result = await resp.json()
-                except Exception as e:
-                    raise HTTPException(
-                        status_code=500, 
-                        detail=f"Failed to parse response from scraper: {str(e)}"
-                    )
-                
-                # Handle and validate the response
-                return handle_apify_response(result)
-                
-    except aiohttp.ClientError as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Network error while connecting to scraper: {str(e)}"
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=504, 
-            detail="Scraping request timed out. The account may have too many posts or be temporarily unavailable."
-        )
-
-def process_results(raw_results: List[Dict]) -> List[Dict]:
-    """Clean and select only required fields"""
-    if not raw_results:
-        raise HTTPException(status_code=404, detail="No posts found")
-    
-    processed = []
-    for post in raw_results:
-        # Skip invalid post objects
-        if not isinstance(post, dict):
-            continue
+            # Timeout reached
+            raise HTTPException(status_code=408, detail="Extraction timeout - try reducing the limit or try again later")
         
-        # Handle the extended output function fields
-        processed.append({
-            "post_url": post.get("url", ""),
-            "caption": post.get("caption", ""),
-            "hashtags": ", ".join(post.get("hashtags", [])) if post.get("hashtags") else "",
-            "top_comments": " | ".join(post.get("comments", [])[:5]) if post.get("comments") else ""
-        })
+        # Get results
+        try:
+            response = self.session.get(dataset_url, timeout=60)
+            if response.status_code == 200:
+                results = response.json()
+                return results if results else []
+            else:
+                logger.error(f"Failed to get results: {response.status_code} - {response.text}")
+                raise HTTPException(status_code=500, detail=f"Failed to get results: {response.text}")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error getting results: {e}")
+            raise HTTPException(status_code=500, detail=f"Network error getting results: {str(e)}")
     
-    if not processed:
-        raise HTTPException(status_code=404, detail="No valid posts found")
-    
-    return processed
+    def process_results(self, raw_results: List[Dict]) -> List[Dict]:
+        """Process and extract only title, caption, and hashtags"""
+        if not raw_results:
+            return []
+            
+        processed_posts = []
+        
+        for i, post in enumerate(raw_results):
+            try:
+                # Extract caption
+                caption = post.get("caption", "").strip()
+                
+                # Create title from caption (full caption as title if no separate title exists)
+                title = caption if caption else f"Post {i+1}"
+                
+                # Extract hashtags
+                hashtags_list = post.get("hashtags", [])
+                hashtags = ", ".join([f"#{tag}" if not tag.startswith("#") else tag for tag in hashtags_list])
+                
+                # Create minimal post data with only required fields
+                processed_post = {
+                    "title": title,
+                    "caption": caption,
+                    "hashtags": hashtags
+                }
+                
+                processed_posts.append(processed_post)
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Error processing post {i}: {e}")
+                continue
+        
+        return processed_posts
 
-def results_to_csv(posts: List[Dict]) -> io.StringIO:
-    """Convert posts list to CSV string buffer"""
+# ----------------------------
+# UTILITY FUNCTIONS
+# ----------------------------
+def validate_username(username: str) -> str:
+    """Validate and clean Instagram username"""
+    username = username.strip().replace("@", "").lower()
+    
+    if not username:
+        raise HTTPException(status_code=400, detail="Username cannot be empty")
+    
+    if len(username) > 30:
+        raise HTTPException(status_code=400, detail="Username too long (max 30 characters)")
+    
+    # Basic username validation
+    import re
+    if not re.match("^[a-zA-Z0-9._]+$", username):
+        raise HTTPException(status_code=400, detail="Invalid username format (only letters, numbers, dots, underscores allowed)")
+    
+    return username
+
+def create_csv_response(posts: List[Dict], username: str) -> StreamingResponse:
+    """Create CSV response with only title, caption, and hashtags"""
     output = io.StringIO()
+    fieldnames = ["title", "caption", "hashtags"]
     
-    if not posts:
-        raise HTTPException(status_code=404, detail="No posts found")
-
-    fieldnames = ["post_url", "caption", "hashtags", "top_comments"]
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
     writer.writerows(posts)
-    output.seek(0)
-    return output
+
+    buffer = io.BytesIO()
+    buffer.write(output.getvalue().encode("utf-8"))
+    buffer.seek(0)
+    
+    headers = {
+        "Content-Disposition": f"attachment; filename={username}_posts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    }
+    
+    return StreamingResponse(
+        io.BytesIO(buffer.read()), 
+        media_type="text/csv", 
+        headers=headers
+    )
 
 # ----------------------------
-# ROUTES
+# FASTAPI ROUTES
 # ----------------------------
+@app.get("/")
+def root():
+    return {
+        "status": "ok", 
+        "message": "Instagram Post Extractor API 🚀",
+        "version": "4.0",
+        "description": "Extract Instagram posts with title, caption, and hashtags only",
+        "endpoints": {
+            "extract": "/extract_posts",
+            "extract_all": "/extract_posts (with extract_all=true)",
+            "health": "/health",
+            "docs": "/docs"
+        }
+    }
 
-@app.post("/scrape_posts")
-async def scrape_posts(payload: ScrapeRequest):
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    apify_token = os.getenv("APIFY_TOKEN")
+    
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "apify_configured": bool(apify_token),
+        "version": "4.0",
+        "features": ["title", "caption", "hashtags", "custom_limits", "extract_all"]
+    }
+
+@app.post("/extract_posts")
+def extract_posts_endpoint(payload: ScrapeRequest):
+    """
+    Extract Instagram posts with only essential data
+    
+    Parameters:
+    - username: Instagram username (without @)
+    - limit: Number of posts to extract (1-1000, default: 50)
+    - extract_all: Extract all available posts (ignores limit)
+    
+    Returns:
+    - CSV file with title, caption, and hashtags only
+    """
+    
+    # Validate input
+    username = validate_username(payload.username)
+    limit = payload.limit or 50
+    extract_all = payload.extract_all or False
+    
+    # Validate limit
+    if not extract_all and (limit < 1 or limit > 1000):
+        raise HTTPException(
+            status_code=400, 
+            detail="Limit must be between 1 and 1000 posts"
+        )
+    
+    # Get Apify token from environment
+    apify_token = os.getenv("APIFY_TOKEN")
+    if not apify_token:
+        logger.error("APIFY_TOKEN environment variable not set")
+        raise HTTPException(
+            status_code=500, 
+            detail="APIFY_TOKEN environment variable not set. Please configure your Apify API token."
+        )
+    
+    logger.info(f"Starting extraction for @{username} {'(ALL POSTS)' if extract_all else f'(Limit: {limit})'}")
+    
     try:
-        # Clean username (remove @ if present)
-        username = payload.username.lstrip('@').strip()
+        extractor = InstagramPostExtractor(apify_token)
         
-        if not username:
-            raise HTTPException(status_code=400, detail="Username cannot be empty")
-        
-        raw = await scrape_user_posts(username)
-        processed = process_results(raw)
-        csv_buffer = results_to_csv(processed)
-        
-        filename = f"{username}_posts_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
-        
-        return StreamingResponse(
-            iter([csv_buffer.getvalue()]),
-            media_type="text/csv",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        # Extract posts
+        raw_posts = extractor.extract_posts(
+            username=username,
+            limit=limit,
+            extract_all=extract_all
         )
         
+        # Process the results (only title, caption, hashtags)
+        posts = extractor.process_results(raw_posts)
+        
+        if not posts:
+            logger.warning(f"No posts found for user: {username}")
+            raise HTTPException(
+                status_code=404, 
+                detail=f"No posts found for user '{username}'. The user might not exist, be private, or have no posts."
+            )
+        
+        logger.info(f"Successfully extracted {len(posts)} posts for @{username}")
+        
+        # Return CSV file with only essential data
+        return create_csv_response(posts, username)
+        
     except HTTPException as e:
+        # Re-raise HTTP exceptions as-is
         raise e
     except Exception as e:
-        # Catch any unexpected errors
+        logger.error(f"Unexpected error in extract_posts_endpoint: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"An unexpected error occurred: {str(e)}"
         )
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+@app.get("/extract_posts/{username}")
+def extract_posts_get_endpoint(
+    username: str, 
+    limit: int = Query(default=50, ge=1, le=1000, description="Number of posts to extract"),
+    extract_all: bool = Query(default=False, description="Extract all available posts")
+):
+    """
+    Alternative GET endpoint for extracting posts
+    """
+    payload = ScrapeRequest(
+        username=username, 
+        limit=limit,
+        extract_all=extract_all
+    )
+    return extract_posts_endpoint(payload)
+
+@app.post("/extract_all_posts/{username}")
+def extract_all_posts_endpoint(username: str):
+    """
+    Convenience endpoint to extract ALL posts from a user
+    """
+    payload = ScrapeRequest(
+        username=username,
+        extract_all=True
+    )
+    return extract_posts_endpoint(payload)
+
+# Error handlers
+@app.exception_handler(404)
+async def not_found_handler(request, exc):
+    return JSONResponse(
+        status_code=404,
+        content={"error": "Endpoint not found", "message": "The requested endpoint does not exist"}
+    )
+
+@app.exception_handler(500)
+async def internal_error_handler(request, exc):
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error", "message": "Something went wrong on our end"}
+    )
+
+# ----------------------------
+# ENTRY POINT
+# ----------------------------
+if __name__ == "__main__":
+    # Check for required environment variables
+    if not os.getenv("APIFY_TOKEN"):
+        print("⚠️ Warning: APIFY_TOKEN environment variable not set!")
+        print("Get your token from: https://console.apify.com/account/integrations")
+    
+    port = int(os.getenv("PORT", 8000))
+    
+    print(f"🚀 Starting Instagram Post Extractor API on port {port}")
+    print("📚 API Documentation available at: http://localhost:8000/docs")
+    print("✨ Features: Title, Caption, Hashtags extraction with custom limits")
+    
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        timeout_keep_alive=300,
+        access_log=True
+    )
