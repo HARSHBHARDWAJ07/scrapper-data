@@ -6,9 +6,10 @@ import aiohttp
 import re
 from datetime import datetime
 from typing import List, Dict
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from typing import Optional
 
 # ----------------------------
 # CONFIGURATION
@@ -29,7 +30,7 @@ app = FastAPI(title="Instagram Scraper API", version="1.0")
 
 class ScrapeRequest(BaseModel):
     username: str
-    limit: int = None  # Optional limit parameter
+    limit: Optional[int] = None  # Optional limit parameter
 
 # ----------------------------
 # HELPER FUNCTIONS
@@ -203,33 +204,48 @@ def results_to_csv(posts: List[Dict]) -> io.StringIO:
 # ----------------------------
 
 @app.post("/scrape_posts")
-async def scrape_posts(payload: ScrapeRequest):
+async def scrape_posts(
+    # Support both JSON and form data
+    payload: ScrapeRequest = None,
+    username: str = Form(None),
+    limit: Optional[int] = Form(None)
+):
     try:
-        # Add request logging for debugging
-        print(f"Received request: {payload}")
+        # Handle both JSON payload and form data
+        if payload:
+            # JSON request
+            final_username = payload.username
+            final_limit = payload.limit
+            print(f"Received JSON request: username={final_username}, limit={final_limit}")
+        else:
+            # Form data request
+            if not username:
+                raise HTTPException(status_code=400, detail="Username is required")
+            final_username = username
+            final_limit = limit
+            print(f"Received form data request: username={final_username}, limit={final_limit}")
         
         # Clean username (remove @ if present)
-        username = payload.username.lstrip('@').strip()
+        final_username = final_username.lstrip('@').strip()
         
-        if not username:
+        if not final_username:
             raise HTTPException(status_code=400, detail="Username cannot be empty")
         
-        print(f"Processing username: {username}")
+        print(f"Processing username: {final_username}")
         
         # Validate limit if provided
-        limit = payload.limit
-        if limit is not None and limit <= 0:
+        if final_limit is not None and final_limit <= 0:
             raise HTTPException(status_code=400, detail="Limit must be a positive number")
         
-        print(f"Using limit: {limit}")
+        print(f"Using limit: {final_limit}")
         
         # Scrape posts (will get all posts if limit is None)
-        raw = await scrape_user_posts(username, results_limit=limit)
+        raw = await scrape_user_posts(final_username, results_limit=final_limit)
         
         print(f"Scraped {len(raw) if raw else 0} posts")
         
         # Process results with limit applied
-        processed = process_results(raw, limit=limit)
+        processed = process_results(raw, limit=final_limit)
         
         print(f"Processed {len(processed)} posts")
         
@@ -237,8 +253,8 @@ async def scrape_posts(payload: ScrapeRequest):
         csv_buffer = results_to_csv(processed)
         
         # Create filename with limit info
-        limit_suffix = f"_limit_{limit}" if limit else "_all"
-        filename = f"{username}_posts{limit_suffix}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+        limit_suffix = f"_limit_{final_limit}" if final_limit else "_all"
+        filename = f"{final_username}_posts{limit_suffix}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
         
         print(f"Returning CSV file: {filename}")
         
@@ -254,6 +270,48 @@ async def scrape_posts(payload: ScrapeRequest):
     except Exception as e:
         # Catch any unexpected errors
         print(f"Unexpected error: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+# Alternative endpoint specifically for form data (if needed)
+@app.post("/scrape_posts_form")
+async def scrape_posts_form(
+    username: str = Form(...),
+    limit: Optional[int] = Form(None)
+):
+    try:
+        print(f"Form endpoint - username: {username}, limit: {limit}")
+        
+        # Clean username (remove @ if present)
+        username = username.lstrip('@').strip()
+        
+        if not username:
+            raise HTTPException(status_code=400, detail="Username cannot be empty")
+        
+        # Validate limit if provided
+        if limit is not None and limit <= 0:
+            raise HTTPException(status_code=400, detail="Limit must be a positive number")
+        
+        # Scrape posts
+        raw = await scrape_user_posts(username, results_limit=limit)
+        processed = process_results(raw, limit=limit)
+        csv_buffer = results_to_csv(processed)
+        
+        # Create filename
+        limit_suffix = f"_limit_{limit}" if limit else "_all"
+        filename = f"{username}_posts{limit_suffix}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+        
+        return StreamingResponse(
+            iter([csv_buffer.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
         raise HTTPException(
             status_code=500, 
             detail=f"An unexpected error occurred: {str(e)}"
