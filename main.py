@@ -4,6 +4,7 @@ import io
 import asyncio
 import aiohttp
 import re
+import urllib.parse
 from datetime import datetime
 from typing import List, Dict
 from fastapi import FastAPI, HTTPException, Request
@@ -126,14 +127,54 @@ def results_to_csv(posts: List[Dict]) -> io.StringIO:
 @app.post("/scrape_posts")
 async def scrape_posts(request: Request):
     try:
-        # Get form data
-        form_data = await request.form()
-        username = form_data.get("username")
+        username = None
         
-        print(f"Received username: {username}")
+        # Try multiple ways to get the username
+        content_type = request.headers.get("content-type", "").lower()
+        print(f"Content-Type: {content_type}")
+        
+        # Method 1: Try form data
+        try:
+            form_data = await request.form()
+            username = form_data.get("username")
+            print(f"Form data - username: {username}")
+            if username:
+                print(f"Got username from form: {username}")
+        except Exception as e:
+            print(f"Form parsing failed: {e}")
+        
+        # Method 2: Try JSON if form failed
+        if not username:
+            try:
+                json_data = await request.json()
+                username = json_data.get("username")
+                print(f"JSON data - username: {username}")
+                if username:
+                    print(f"Got username from JSON: {username}")
+            except Exception as e:
+                print(f"JSON parsing failed: {e}")
+        
+        # Method 3: Try raw body parsing
+        if not username:
+            try:
+                body = await request.body()
+                body_str = body.decode('utf-8')
+                print(f"Raw body: {body_str}")
+                
+                # Parse URL-encoded data manually
+                if 'username=' in body_str:
+                    import urllib.parse
+                    parsed = urllib.parse.parse_qs(body_str)
+                    if 'username' in parsed:
+                        username = parsed['username'][0]
+                        print(f"Got username from raw parsing: {username}")
+            except Exception as e:
+                print(f"Raw body parsing failed: {e}")
+        
+        print(f"Final username received: {username}")
         
         if not username:
-            raise HTTPException(status_code=400, detail="Username is required")
+            raise HTTPException(status_code=400, detail="Username is required - check your request format")
         
         # Clean username
         username = str(username).lstrip('@').strip()
