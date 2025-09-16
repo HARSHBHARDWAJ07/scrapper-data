@@ -6,10 +6,8 @@ import aiohttp
 import re
 from datetime import datetime
 from typing import List, Dict
-from fastapi import FastAPI, HTTPException, Form
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from typing import Optional
 
 # ----------------------------
 # CONFIGURATION
@@ -19,18 +17,9 @@ APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 if not APIFY_TOKEN:
     raise ValueError("Please set APIFY_TOKEN in environment variables (Render dashboard).")
 
-# Correct endpoint: run-sync-get-dataset-items
 BASE_URL = f"https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
 
 app = FastAPI(title="Instagram Scraper API", version="1.0")
-
-# ----------------------------
-# MODELS
-# ----------------------------
-
-class ScrapeRequest(BaseModel):
-    username: str
-    limit: Optional[int] = None  # Optional limit parameter
 
 # ----------------------------
 # HELPER FUNCTIONS
@@ -38,52 +27,32 @@ class ScrapeRequest(BaseModel):
 
 def validate_username(username: str) -> bool:
     """Validate Instagram username format"""
-    # Instagram usernames: 1-30 chars, alphanumeric + dots + underscores, no consecutive dots
     pattern = r'^[a-zA-Z0-9._]{1,30}$'
     if not re.match(pattern, username):
         return False
-    if '..' in username:  # No consecutive dots
+    if '..' in username:
         return False
     return True
 
 def handle_apify_response(response_data) -> List[Dict]:
     """Handle Apify API response and check for errors"""
-    # If response is a list, check for error objects
     if isinstance(response_data, list):
         if len(response_data) == 0:
-            raise HTTPException(status_code=404, detail="No posts found - account may be private, doesn't exist, or has no posts")
+            raise HTTPException(status_code=404, detail="No posts found")
         
-        # Check if first item is an error object
         first_item = response_data[0]
         if isinstance(first_item, dict) and "error" in first_item:
             error_type = first_item.get("error", "unknown")
-            error_desc = first_item.get("errorDescription", "Unknown error occurred")
-            
             if error_type == "no_items":
-                raise HTTPException(
-                    status_code=404, 
-                    detail="Account not found, is private, or has no posts available"
-                )
+                raise HTTPException(status_code=404, detail="Account not found or private")
             else:
-                raise HTTPException(
-                    status_code=500, 
-                    detail=f"Scraping failed: {error_desc}"
-                )
+                raise HTTPException(status_code=500, detail="Scraping failed")
     
-    # If response is a dict, it might be an error response
     elif isinstance(response_data, dict):
         if "error" in response_data:
-            error_msg = response_data.get("error", {}).get("message", "Unknown API error")
-            raise HTTPException(status_code=500, detail=f"API Error: {error_msg}")
-        
-        # If it's a dict but not an error, it might be wrapped data
+            raise HTTPException(status_code=500, detail="API Error")
         if "items" in response_data:
             return response_data["items"]
-        else:
-            raise HTTPException(status_code=500, detail="Unexpected response format from scraper")
-    
-    else:
-        raise HTTPException(status_code=500, detail="Invalid response format from scraper")
     
     return response_data
 
@@ -91,21 +60,12 @@ def handle_apify_response(response_data) -> List[Dict]:
 # SCRAPER
 # ----------------------------
 
-async def scrape_user_posts(username: str, results_limit: int = None) -> List[Dict]:
-    """Scrape Instagram posts for a specific user from Apify actor"""
+async def scrape_user_posts(username: str, results_limit: int = 10000) -> List[Dict]:
+    """Scrape Instagram posts"""
     
-    # Validate username format
     if not validate_username(username):
-        raise HTTPException(
-            status_code=400, 
-            detail="Invalid username format. Username should contain only letters, numbers, dots, and underscores (1-30 characters)"
-        )
+        raise HTTPException(status_code=400, detail="Invalid username format")
     
-    # Set default limit to get all posts if not specified
-    if results_limit is None:
-        results_limit = 10000  # Large number to get all posts
-    
-    # Use directUrls instead of usernames
     instagram_url = f"https://www.instagram.com/{username}/"
     
     run_input = {
@@ -123,75 +83,35 @@ async def scrape_user_posts(username: str, results_limit: int = None) -> List[Di
         "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
     }
 
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
-            async with session.post(BASE_URL, json=run_input) as resp:
-                # Accept both 200 and 201 as success codes
-                if resp.status not in [200, 201]:
-                    error_text = await resp.text()
-                    raise HTTPException(
-                        status_code=500, 
-                        detail=f"Apify API returned status {resp.status}: {error_text}"
-                    )
-                
-                try:
-                    result = await resp.json()
-                except Exception as e:
-                    raise HTTPException(
-                        status_code=500, 
-                        detail=f"Failed to parse response from scraper: {str(e)}"
-                    )
-                
-                # Handle and validate the response
-                return handle_apify_response(result)
-                
-    except aiohttp.ClientError as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Network error while connecting to scraper: {str(e)}"
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=504, 
-            detail="Scraping request timed out. The account may have too many posts or be temporarily unavailable."
-        )
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
+        async with session.post(BASE_URL, json=run_input) as resp:
+            if resp.status not in [200, 201]:
+                raise HTTPException(status_code=500, detail="Scraper API error")
+            
+            result = await resp.json()
+            return handle_apify_response(result)
 
-def process_results(raw_results: List[Dict], limit: int = None) -> List[Dict]:
-    """Clean and select only required fields: caption, hashtags, title"""
+def process_results(raw_results: List[Dict]) -> List[Dict]:
+    """Process results to get only caption, hashtags, title"""
     if not raw_results:
         raise HTTPException(status_code=404, detail="No posts found")
     
     processed = []
     for post in raw_results:
-        # Skip invalid post objects
         if not isinstance(post, dict):
             continue
         
-        # Extract only the required fields
-        processed_post = {
+        processed.append({
             "caption": post.get("caption", ""),
             "hashtags": ", ".join(post.get("hashtags", [])) if post.get("hashtags") else "",
             "title": post.get("title", "")
-        }
-        processed.append(processed_post)
-        
-        # Apply limit if specified
-        if limit and len(processed) >= limit:
-            break
-    
-    if not processed:
-        raise HTTPException(status_code=404, detail="No valid posts found")
+        })
     
     return processed
 
 def results_to_csv(posts: List[Dict]) -> io.StringIO:
-    """Convert posts list to CSV string buffer"""
+    """Convert to CSV"""
     output = io.StringIO()
-    
-    if not posts:
-        raise HTTPException(status_code=404, detail="No posts found")
-
-    # Only these three fields
     fieldnames = ["caption", "hashtags", "title"]
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
@@ -204,104 +124,31 @@ def results_to_csv(posts: List[Dict]) -> io.StringIO:
 # ----------------------------
 
 @app.post("/scrape_posts")
-async def scrape_posts(
-    # Support both JSON and form data
-    payload: ScrapeRequest = None,
-    username: str = Form(None),
-    limit: Optional[int] = Form(None)
-):
+async def scrape_posts(request: Request):
     try:
-        # Handle both JSON payload and form data
-        if payload:
-            # JSON request
-            final_username = payload.username
-            final_limit = payload.limit
-            print(f"Received JSON request: username={final_username}, limit={final_limit}")
-        else:
-            # Form data request
-            if not username:
-                raise HTTPException(status_code=400, detail="Username is required")
-            final_username = username
-            final_limit = limit
-            print(f"Received form data request: username={final_username}, limit={final_limit}")
+        # Get form data
+        form_data = await request.form()
+        username = form_data.get("username")
         
-        # Clean username (remove @ if present)
-        final_username = final_username.lstrip('@').strip()
+        print(f"Received username: {username}")
         
-        if not final_username:
-            raise HTTPException(status_code=400, detail="Username cannot be empty")
+        if not username:
+            raise HTTPException(status_code=400, detail="Username is required")
         
-        print(f"Processing username: {final_username}")
-        
-        # Validate limit if provided
-        if final_limit is not None and final_limit <= 0:
-            raise HTTPException(status_code=400, detail="Limit must be a positive number")
-        
-        print(f"Using limit: {final_limit}")
-        
-        # Scrape posts (will get all posts if limit is None)
-        raw = await scrape_user_posts(final_username, results_limit=final_limit)
-        
-        print(f"Scraped {len(raw) if raw else 0} posts")
-        
-        # Process results with limit applied
-        processed = process_results(raw, limit=final_limit)
-        
-        print(f"Processed {len(processed)} posts")
-        
-        # Generate CSV
-        csv_buffer = results_to_csv(processed)
-        
-        # Create filename with limit info
-        limit_suffix = f"_limit_{final_limit}" if final_limit else "_all"
-        filename = f"{final_username}_posts{limit_suffix}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
-        
-        print(f"Returning CSV file: {filename}")
-        
-        return StreamingResponse(
-            iter([csv_buffer.getvalue()]),
-            media_type="text/csv",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
-        )
-        
-    except HTTPException as e:
-        print(f"HTTP Exception: {e.detail}")
-        raise e
-    except Exception as e:
-        # Catch any unexpected errors
-        print(f"Unexpected error: {str(e)}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"An unexpected error occurred: {str(e)}"
-        )
-
-# Alternative endpoint specifically for form data (if needed)
-@app.post("/scrape_posts_form")
-async def scrape_posts_form(
-    username: str = Form(...),
-    limit: Optional[int] = Form(None)
-):
-    try:
-        print(f"Form endpoint - username: {username}, limit: {limit}")
-        
-        # Clean username (remove @ if present)
-        username = username.lstrip('@').strip()
+        # Clean username
+        username = str(username).lstrip('@').strip()
         
         if not username:
             raise HTTPException(status_code=400, detail="Username cannot be empty")
         
-        # Validate limit if provided
-        if limit is not None and limit <= 0:
-            raise HTTPException(status_code=400, detail="Limit must be a positive number")
+        print(f"Processing: {username}")
         
         # Scrape posts
-        raw = await scrape_user_posts(username, results_limit=limit)
-        processed = process_results(raw, limit=limit)
+        raw = await scrape_user_posts(username)
+        processed = process_results(raw)
         csv_buffer = results_to_csv(processed)
         
-        # Create filename
-        limit_suffix = f"_limit_{limit}" if limit else "_all"
-        filename = f"{username}_posts{limit_suffix}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+        filename = f"{username}_posts_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
         
         return StreamingResponse(
             iter([csv_buffer.getvalue()]),
@@ -312,12 +159,9 @@ async def scrape_posts_form(
     except HTTPException as e:
         raise e
     except Exception as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"An unexpected error occurred: {str(e)}"
-        )
+        print(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {"status": "healthy"}
