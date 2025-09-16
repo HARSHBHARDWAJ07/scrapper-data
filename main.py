@@ -35,57 +35,20 @@ def validate_username(username: str) -> bool:
         return False
     return True
 
-def handle_apify_response(response_data) -> List[Dict]:
-    """Handle Apify API response and check for errors"""
-    print(f"Handling response - type: {type(response_data)}")
-    
-    if isinstance(response_data, list):
-        print(f"List response with {len(response_data)} items")
-        
-        if len(response_data) == 0:
-            raise HTTPException(status_code=404, detail="No posts found")
-        
-        first_item = response_data[0]
-        print(f"First item: {first_item}")
-        
-        if isinstance(first_item, dict) and "error" in first_item:
-            error_type = first_item.get("error", "unknown")
-            error_desc = first_item.get("errorDescription", "Unknown error")
-            print(f"Error in response: {error_type} - {error_desc}")
-            
-            if error_type == "no_items":
-                raise HTTPException(status_code=404, detail="Account not found, private, or has no posts")
-            else:
-                raise HTTPException(status_code=500, detail=f"Scraping failed: {error_desc}")
-    
-    elif isinstance(response_data, dict):
-        print(f"Dict response: {response_data}")
-        
-        if "error" in response_data:
-            error_msg = response_data.get("error", {})
-            print(f"Dict error: {error_msg}")
-            raise HTTPException(status_code=500, detail=f"API Error: {error_msg}")
-        
-        if "items" in response_data:
-            print(f"Found items in dict: {len(response_data['items'])}")
-            return response_data["items"]
-    
-    print(f"Returning response_data as-is")
-    return response_data
-
 # ----------------------------
 # SCRAPER
 # ----------------------------
 
-async def scrape_user_posts(username: str, results_limit: int = 10000) -> List[Dict]:
-    """Scrape Instagram posts"""
+async def scrape_user_posts(username: str, results_limit: int = 1000) -> List[Dict]:
+    """Scrape Instagram posts using working configuration"""
     
     if not validate_username(username):
         raise HTTPException(status_code=400, detail="Invalid username format")
     
     instagram_url = f"https://www.instagram.com/{username}/"
-    print(f"Instagram URL: {instagram_url}")
+    print(f"Scraping: {instagram_url}")
     
+    # Use the exact working configuration from your example
     run_input = {
         "directUrls": [instagram_url],
         "resultsType": "posts",
@@ -95,76 +58,114 @@ async def scrape_user_posts(username: str, results_limit: int = 10000) -> List[D
         "addParentData": False,
         "enhanceUserSearchWithFacebookPage": False,
         "includeHasStories": False,
-        "extendOutputFunction": "($) => {\n  const caption = $.caption || \"\";\n  const hashtags = caption.match(/#\\w+/g) || [];\n  const title = $.title || caption || \"\";\n  return {\n    caption,\n    hashtags,\n    title\n  };\n}",
+        "extendOutputFunction": "($) => {\n  const caption = $.caption || \"\";\n  const hashtags = caption.match(/#\\w+/g) || [];\n  const title = $.title || caption || \"\";\n  return {\n    caption,\n    hashtags,\n    title\n };\n}",
         "extendScraperFunction": "async ({ page, request, customData, Apify, signal, label }) => {}",
         "customData": {},
-        "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
+        "proxy": {
+            "useApifyProxy": True,
+            "apifyProxyGroups": ["RESIDENTIAL"]
+        }
     }
 
-    print(f"Making request to: {BASE_URL}")
-    print(f"Request payload: {run_input}")
-
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
+        # Use longer timeout for Instagram scraping
+        timeout = aiohttp.ClientTimeout(total=600)  # 10 minutes
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            print(f"Sending request to Apify API...")
+            
             async with session.post(BASE_URL, json=run_input) as resp:
                 print(f"Response status: {resp.status}")
                 
                 if resp.status not in [200, 201]:
                     error_text = await resp.text()
-                    print(f"Error response: {error_text}")
-                    raise HTTPException(status_code=500, detail=f"Scraper API error: {error_text}")
+                    print(f"API Error: {error_text}")
+                    raise HTTPException(
+                        status_code=500, 
+                        detail=f"Apify API error (status {resp.status}): {error_text[:200]}"
+                    )
                 
-                result = await resp.json()
-                print(f"Raw result type: {type(result)}")
-                print(f"Raw result length: {len(result) if isinstance(result, list) else 'N/A'}")
+                try:
+                    result = await resp.json()
+                    print(f"Received {len(result) if isinstance(result, list) else 'non-list'} items")
+                    
+                    # Handle the response
+                    if isinstance(result, list):
+                        if len(result) == 0:
+                            raise HTTPException(status_code=404, detail="No posts found - account may be private or empty")
+                        
+                        # Check for error in first item
+                        first_item = result[0]
+                        if isinstance(first_item, dict) and "error" in first_item:
+                            error_type = first_item.get("error")
+                            error_desc = first_item.get("errorDescription", "")
+                            
+                            if error_type == "no_items":
+                                raise HTTPException(status_code=404, detail="Account not found, is private, or has no posts")
+                            else:
+                                raise HTTPException(status_code=500, detail=f"Scraping failed: {error_desc}")
+                        
+                        # Filter out any error objects and return valid posts
+                        valid_posts = []
+                        for item in result:
+                            if isinstance(item, dict) and "error" not in item:
+                                valid_posts.append(item)
+                        
+                        if not valid_posts:
+                            raise HTTPException(status_code=404, detail="No valid posts found")
+                        
+                        print(f"Found {len(valid_posts)} valid posts")
+                        return valid_posts
+                    
+                    else:
+                        raise HTTPException(status_code=500, detail="Unexpected response format")
+                        
+                except Exception as json_error:
+                    print(f"JSON parsing error: {json_error}")
+                    raise HTTPException(status_code=500, detail="Invalid response format from scraper")
                 
-                if isinstance(result, list) and len(result) > 0:
-                    print(f"First item: {result[0]}")
-                
-                return handle_apify_response(result)
-                
+    except asyncio.TimeoutError:
+        print("Request timed out")
+        raise HTTPException(status_code=504, detail="Scraping request timed out - try again later")
     except aiohttp.ClientError as e:
         print(f"Network error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Network error: {str(e)}")
-    except asyncio.TimeoutError as e:
-        print(f"Timeout error: {str(e)}")
-        raise HTTPException(status_code=504, detail="Request timeout")
     except Exception as e:
-        print(f"Unexpected error in scrape_user_posts: {str(e)}")
+        print(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Scraping error: {str(e)}")
 
 def process_results(raw_results: List[Dict]) -> List[Dict]:
-    """Process results to get only caption, hashtags, title"""
-    print(f"Processing {len(raw_results) if raw_results else 0} raw results")
-    
-    if not raw_results:
-        raise HTTPException(status_code=404, detail="No posts found")
+    """Process results to extract caption, hashtags, and title"""
+    print(f"Processing {len(raw_results)} posts")
     
     processed = []
     for i, post in enumerate(raw_results):
-        print(f"Processing post {i}: {type(post)}")
-        
         if not isinstance(post, dict):
-            print(f"Skipping non-dict post: {post}")
             continue
         
-        # Log available keys for debugging
-        print(f"Post keys: {list(post.keys())}")
+        # Extract data using the field names from extendOutputFunction
+        caption = post.get("caption", "")
+        hashtags = post.get("hashtags", [])
+        title = post.get("postTitle", "") or post.get("title", "")
+        
+        # Convert hashtags to string if it's a list
+        if isinstance(hashtags, list):
+            hashtags_str = ", ".join(hashtags)
+        else:
+            hashtags_str = str(hashtags) if hashtags else ""
         
         processed_post = {
-            "caption": post.get("caption", ""),
-            "hashtags": ", ".join(post.get("hashtags", [])) if post.get("hashtags") else "",
-            "title": post.get("title", "")
+            "caption": caption,
+            "hashtags": hashtags_str,
+            "title": title
         }
         
-        print(f"Processed post: {processed_post}")
         processed.append(processed_post)
+        
+        if i < 3:  # Log first few posts for debugging
+            print(f"Post {i}: caption={len(caption)} chars, hashtags={len(hashtags_str)} chars, title={len(title)} chars")
     
-    print(f"Final processed count: {len(processed)}")
-    
-    if not processed:
-        raise HTTPException(status_code=404, detail="No valid posts found")
-    
+    print(f"Successfully processed {len(processed)} posts")
     return processed
 
 def results_to_csv(posts: List[Dict]) -> io.StringIO:
@@ -186,67 +187,66 @@ async def scrape_posts(request: Request):
     try:
         username = None
         
-        # Try multiple ways to get the username
+        # Parse request body
         content_type = request.headers.get("content-type", "").lower()
         print(f"Content-Type: {content_type}")
         
-        # Method 1: Try form data
+        # Try JSON first (most common)
         try:
-            form_data = await request.form()
-            username = form_data.get("username")
-            print(f"Form data - username: {username}")
+            json_data = await request.json()
+            username = json_data.get("username")
             if username:
-                print(f"Got username from form: {username}")
-        except Exception as e:
-            print(f"Form parsing failed: {e}")
+                print(f"Got username from JSON: {username}")
+        except:
+            pass
         
-        # Method 2: Try JSON if form failed
+        # Try form data as fallback
         if not username:
             try:
-                json_data = await request.json()
-                username = json_data.get("username")
-                print(f"JSON data - username: {username}")
+                form_data = await request.form()
+                username = form_data.get("username")
                 if username:
-                    print(f"Got username from JSON: {username}")
-            except Exception as e:
-                print(f"JSON parsing failed: {e}")
+                    print(f"Got username from form: {username}")
+            except:
+                pass
         
-        # Method 3: Try raw body parsing
+        # Try raw body parsing as last resort
         if not username:
             try:
                 body = await request.body()
                 body_str = body.decode('utf-8')
-                print(f"Raw body: {body_str}")
-                
-                # Parse URL-encoded data manually
                 if 'username=' in body_str:
-                    import urllib.parse
                     parsed = urllib.parse.parse_qs(body_str)
                     if 'username' in parsed:
                         username = parsed['username'][0]
                         print(f"Got username from raw parsing: {username}")
-            except Exception as e:
-                print(f"Raw body parsing failed: {e}")
-        
-        print(f"Final username received: {username}")
+            except:
+                pass
         
         if not username:
-            raise HTTPException(status_code=400, detail="Username is required - check your request format")
+            raise HTTPException(status_code=400, detail="Username is required")
         
         # Clean username
         username = str(username).lstrip('@').strip()
-        
         if not username:
             raise HTTPException(status_code=400, detail="Username cannot be empty")
         
-        print(f"Processing: {username}")
+        print(f"Processing username: {username}")
         
         # Scrape posts
-        raw = await scrape_user_posts(username)
-        processed = process_results(raw)
-        csv_buffer = results_to_csv(processed)
+        raw_posts = await scrape_user_posts(username, results_limit=1000)
         
-        filename = f"{username}_posts_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+        # Process results
+        processed_posts = process_results(raw_posts)
+        
+        if not processed_posts:
+            raise HTTPException(status_code=404, detail="No posts found after processing")
+        
+        # Generate CSV
+        csv_buffer = results_to_csv(processed_posts)
+        
+        filename = f"{username}_posts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        print(f"Returning {len(processed_posts)} posts as {filename}")
         
         return StreamingResponse(
             iter([csv_buffer.getvalue()]),
@@ -254,12 +254,16 @@ async def scrape_posts(request: Request):
             headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
         
-    except HTTPException as e:
-        raise e
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+@app.get("/")
+async def root():
+    return {"message": "Instagram Scraper API", "status": "running"}
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
