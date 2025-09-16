@@ -99,20 +99,29 @@ async def scrape_user_posts(username: str, max_posts: int = 30) -> List[Dict]:
             detail="Invalid username format. Username should contain only letters, numbers, dots, and underscores (1-30 characters)"
         )
     
+    # Use directUrls instead of usernames - this is the key fix!
+    instagram_url = f"https://www.instagram.com/{username}/"
+    
     run_input = {
-        "usernames": [username],
+        "directUrls": [instagram_url],
         "resultsType": "posts",
         "resultsLimit": max_posts,
         "searchType": "user",
         "searchLimit": 1,
-        "commentsLimit": 10,
+        "addParentData": False,
+        "enhanceUserSearchWithFacebookPage": False,
+        "includeHasStories": False,
+        "extendOutputFunction": "($) => {\n  const caption = $.caption || \"\";\n  const hashtags = caption.match(/#\\w+/g) || [];\n  const comments = ($.latestComments || []).map(c => c.text);\n  return {\n    postTitle: $.title || caption.split(\" \")[0] || \"\",\n    caption,\n    hashtags,\n    comments\n  };\n}",
+        "extendScraperFunction": "async ({ page, request, customData, Apify, signal, label }) => {}",
+        "customData": {},
         "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
     }
 
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
             async with session.post(BASE_URL, json=run_input) as resp:
-                if resp.status != 200:
+                # Accept both 200 and 201 as success codes
+                if resp.status not in [200, 201]:
                     error_text = await resp.text()
                     raise HTTPException(
                         status_code=500, 
@@ -151,12 +160,13 @@ def process_results(raw_results: List[Dict]) -> List[Dict]:
         # Skip invalid post objects
         if not isinstance(post, dict):
             continue
-            
+        
+        # Handle the extended output function fields
         processed.append({
             "post_url": post.get("url", ""),
             "caption": post.get("caption", ""),
-            "hashtags": ", ".join(post.get("hashtags", [])),
-            "top_comments": " | ".join([c.get("text", "") for c in post.get("latestComments", [])[:5] if isinstance(c, dict)])
+            "hashtags": ", ".join(post.get("hashtags", [])) if post.get("hashtags") else "",
+            "top_comments": " | ".join(post.get("comments", [])[:5]) if post.get("comments") else ""
         })
     
     if not processed:
