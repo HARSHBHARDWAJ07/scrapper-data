@@ -18,8 +18,8 @@ APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 if not APIFY_TOKEN:
     raise ValueError("Please set APIFY_TOKEN in environment variables (Render dashboard).")
 
-# Updated endpoint: use the provided scraper service
-BASE_URL = "https://scrapper-data.onrender.com/scrape_posts"
+# Correct endpoint: run-sync-get-dataset-items
+BASE_URL = f"https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
 
 app = FastAPI(title="Instagram Scraper API", version="1.0")
 
@@ -29,6 +29,7 @@ app = FastAPI(title="Instagram Scraper API", version="1.0")
 
 class ScrapeRequest(BaseModel):
     username: str
+    limit: int = None  # Optional limit parameter
 
 # ----------------------------
 # HELPER FUNCTIONS
@@ -89,8 +90,8 @@ def handle_apify_response(response_data) -> List[Dict]:
 # SCRAPER
 # ----------------------------
 
-async def scrape_user_posts(username: str, max_posts: int = 30) -> List[Dict]:
-    """Scrape Instagram posts for a specific user from external scraper service"""
+async def scrape_user_posts(username: str, results_limit: int = None) -> List[Dict]:
+    """Scrape Instagram posts for a specific user from Apify actor"""
     
     # Validate username format
     if not validate_username(username):
@@ -99,18 +100,37 @@ async def scrape_user_posts(username: str, max_posts: int = 30) -> List[Dict]:
             detail="Invalid username format. Username should contain only letters, numbers, dots, and underscores (1-30 characters)"
         )
     
-    # Send request to external scraper service
-    request_payload = {"username": username}
+    # Set default limit to get all posts if not specified
+    if results_limit is None:
+        results_limit = 10000  # Large number to get all posts
+    
+    # Use directUrls instead of usernames
+    instagram_url = f"https://www.instagram.com/{username}/"
+    
+    run_input = {
+        "directUrls": [instagram_url],
+        "resultsType": "posts",
+        "resultsLimit": results_limit,
+        "searchType": "user",
+        "searchLimit": 1,
+        "addParentData": False,
+        "enhanceUserSearchWithFacebookPage": False,
+        "includeHasStories": False,
+        "extendOutputFunction": "($) => {\n  const caption = $.caption || \"\";\n  const hashtags = caption.match(/#\\w+/g) || [];\n  const title = $.title || caption || \"\";\n  return {\n    caption,\n    hashtags,\n    title\n  };\n}",
+        "extendScraperFunction": "async ({ page, request, customData, Apify, signal, label }) => {}",
+        "customData": {},
+        "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
+    }
 
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
-            async with session.post(BASE_URL, json=request_payload) as resp:
+            async with session.post(BASE_URL, json=run_input) as resp:
                 # Accept both 200 and 201 as success codes
                 if resp.status not in [200, 201]:
                     error_text = await resp.text()
                     raise HTTPException(
                         status_code=500, 
-                        detail=f"External scraper API returned status {resp.status}: {error_text}"
+                        detail=f"Apify API returned status {resp.status}: {error_text}"
                     )
                 
                 try:
@@ -135,8 +155,8 @@ async def scrape_user_posts(username: str, max_posts: int = 30) -> List[Dict]:
             detail="Scraping request timed out. The account may have too many posts or be temporarily unavailable."
         )
 
-def process_results(raw_results: List[Dict]) -> List[Dict]:
-    """Clean and select only required fields"""
+def process_results(raw_results: List[Dict], limit: int = None) -> List[Dict]:
+    """Clean and select only required fields: caption, hashtags, title"""
     if not raw_results:
         raise HTTPException(status_code=404, detail="No posts found")
     
@@ -145,13 +165,18 @@ def process_results(raw_results: List[Dict]) -> List[Dict]:
         # Skip invalid post objects
         if not isinstance(post, dict):
             continue
-            
-        processed.append({
-            "post_url": post.get("url", ""),
+        
+        # Extract only the required fields
+        processed_post = {
             "caption": post.get("caption", ""),
-            "hashtags": ", ".join(post.get("hashtags", [])),
-            "top_comments": " | ".join([c.get("text", "") for c in post.get("latestComments", [])[:5] if isinstance(c, dict)])
-        })
+            "hashtags": ", ".join(post.get("hashtags", [])) if post.get("hashtags") else "",
+            "title": post.get("title", "")
+        }
+        processed.append(processed_post)
+        
+        # Apply limit if specified
+        if limit and len(processed) >= limit:
+            break
     
     if not processed:
         raise HTTPException(status_code=404, detail="No valid posts found")
@@ -165,7 +190,8 @@ def results_to_csv(posts: List[Dict]) -> io.StringIO:
     if not posts:
         raise HTTPException(status_code=404, detail="No posts found")
 
-    fieldnames = ["post_url", "caption", "hashtags", "top_comments"]
+    # Only these three fields
+    fieldnames = ["caption", "hashtags", "title"]
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
     writer.writerows(posts)
@@ -185,11 +211,23 @@ async def scrape_posts(payload: ScrapeRequest):
         if not username:
             raise HTTPException(status_code=400, detail="Username cannot be empty")
         
-        raw = await scrape_user_posts(username)
-        processed = process_results(raw)
+        # Validate limit if provided
+        limit = payload.limit
+        if limit is not None and limit <= 0:
+            raise HTTPException(status_code=400, detail="Limit must be a positive number")
+        
+        # Scrape posts (will get all posts if limit is None)
+        raw = await scrape_user_posts(username, results_limit=limit)
+        
+        # Process results with limit applied
+        processed = process_results(raw, limit=limit)
+        
+        # Generate CSV
         csv_buffer = results_to_csv(processed)
         
-        filename = f"{username}_posts_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+        # Create filename with limit info
+        limit_suffix = f"_limit_{limit}" if limit else "_all"
+        filename = f"{username}_posts{limit_suffix}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
         
         return StreamingResponse(
             iter([csv_buffer.getvalue()]),
