@@ -205,22 +205,33 @@ def results_to_csv(posts: List[Dict]) -> io.StringIO:
 @app.post("/scrape_posts")
 async def scrape_posts(payload: ScrapeRequest):
     try:
+        # Add request logging for debugging
+        print(f"Received request: {payload}")
+        
         # Clean username (remove @ if present)
         username = payload.username.lstrip('@').strip()
         
         if not username:
             raise HTTPException(status_code=400, detail="Username cannot be empty")
         
+        print(f"Processing username: {username}")
+        
         # Validate limit if provided
         limit = payload.limit
         if limit is not None and limit <= 0:
             raise HTTPException(status_code=400, detail="Limit must be a positive number")
         
+        print(f"Using limit: {limit}")
+        
         # Scrape posts (will get all posts if limit is None)
         raw = await scrape_user_posts(username, results_limit=limit)
         
+        print(f"Scraped {len(raw) if raw else 0} posts")
+        
         # Process results with limit applied
         processed = process_results(raw, limit=limit)
+        
+        print(f"Processed {len(processed)} posts")
         
         # Generate CSV
         csv_buffer = results_to_csv(processed)
@@ -229,6 +240,8 @@ async def scrape_posts(payload: ScrapeRequest):
         limit_suffix = f"_limit_{limit}" if limit else "_all"
         filename = f"{username}_posts{limit_suffix}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
         
+        print(f"Returning CSV file: {filename}")
+        
         return StreamingResponse(
             iter([csv_buffer.getvalue()]),
             media_type="text/csv",
@@ -236,9 +249,11 @@ async def scrape_posts(payload: ScrapeRequest):
         )
         
     except HTTPException as e:
+        print(f"HTTP Exception: {e.detail}")
         raise e
     except Exception as e:
         # Catch any unexpected errors
+        print(f"Unexpected error: {str(e)}")
         raise HTTPException(
             status_code=500, 
             detail=f"An unexpected error occurred: {str(e)}"
