@@ -1,2 +1,8 @@
-fastapi==0.109.0
-
+fastapi
+uvicorn
+gunicorn
+requests
+python-dotenv
+colorama
+pyfiglet
+instaloader
