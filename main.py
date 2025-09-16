@@ -1,12 +1,11 @@
 import os
 import csv
 import io
-import asyncio
-import aiohttp
+import requests
 import json
 import time
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -25,34 +24,22 @@ class ScrapeRequest(BaseModel):
     username: str
 
 # ----------------------------
-# APIFY INSTAGRAM SCRAPER
+# APIFY INSTAGRAM SCRAPER (SYNC VERSION)
 # ----------------------------
 class ApifyInstagramScraper:
     def __init__(self, apify_token: str):
-        """
-        Initialize Apify Instagram Scraper
-        Get your token from: https://console.apify.com/account/integrations
-        """
         self.apify_token = apify_token
         self.base_url = "https://api.apify.com/v2"
         self.actor_id = "apify/instagram-scraper"
         
-    async def scrape_user_posts(
+    def scrape_user_posts(
         self, 
         username: str, 
         max_posts: int = 20,
         include_comments: bool = True
     ) -> List[Dict]:
         """
-        Scrape Instagram posts for a specific user
-        
-        Args:
-            username: Instagram username (without @)
-            max_posts: Maximum number of posts to scrape
-            include_comments: Whether to include comments
-            
-        Returns:
-            List of post dictionaries
+        Scrape Instagram posts for a specific user using Apify API
         """
         
         # Configuration for the Instagram scraper
@@ -63,58 +50,42 @@ class ApifyInstagramScraper:
             "searchType": "user",
             "searchLimit": 1,
             "addParentData": False,
-            "enhanceUserSearchWithFacebookPage": False,
-            "isUserTaggedFeedURL": False,
-            "onlyPostsWithLocation": False,
-            "likedByLimit": 5,
-            "includeLocationInfo": False,
             "commentsLimit": 10 if include_comments else 0,
-            "extendOutputFunction": "",
-            "extendScraperFunction": "",
-            "customData": {},
             "proxy": {
                 "useApifyProxy": True,
                 "apifyProxyGroups": ["RESIDENTIAL"]
             }
         }
         
-        async with aiohttp.ClientSession() as session:
-            # Start the scraping task
-            print(f"🚀 Starting Instagram scrape for @{username}")
-            start_time = time.time()
-            
-            run_url = f"{self.base_url}/acts/{self.actor_id}/runs"
-            headers = {"Authorization": f"Bearer {self.apify_token}"}
-            
-            # Start the run
-            async with session.post(
-                run_url, 
-                json=run_input, 
-                headers=headers
-            ) as response:
-                if response.status != 201:
-                    error_text = await response.text()
-                    raise HTTPException(status_code=500, detail=f"Failed to start scraping: {error_text}")
-                
-                run_data = await response.json()
-                run_id = run_data["data"]["id"]
-                print(f"⏳ Scraping started. Run ID: {run_id}")
-            
-            # Wait for completion and get results
-            results = await self._wait_for_results(session, run_id, headers)
-            
-            end_time = time.time()
-            print(f"✅ Scraping completed in {end_time - start_time:.2f} seconds")
-            print(f"📊 Found {len(results)} posts")
-            
-            return results
+        # Start the scraping task
+        print(f"🚀 Starting Instagram scrape for @{username}")
+        start_time = time.time()
+        
+        # Start the run
+        run_url = f"{self.base_url}/acts/{self.actor_id}/runs"
+        headers = {
+            "Authorization": f"Bearer {self.apify_token}",
+            "Content-Type": "application/json"
+        }
+        
+        response = requests.post(run_url, json=run_input, headers=headers)
+        if response.status_code != 201:
+            raise HTTPException(status_code=500, detail=f"Failed to start scraping: {response.text}")
+        
+        run_data = response.json()
+        run_id = run_data["data"]["id"]
+        print(f"⏳ Scraping started. Run ID: {run_id}")
+        
+        # Wait for completion and get results
+        results = self._wait_for_results(run_id, headers)
+        
+        end_time = time.time()
+        print(f"✅ Scraping completed in {end_time - start_time:.2f} seconds")
+        print(f"📊 Found {len(results)} posts")
+        
+        return results
     
-    async def _wait_for_results(
-        self, 
-        session: aiohttp.ClientSession, 
-        run_id: str, 
-        headers: Dict
-    ) -> List[Dict]:
+    def _wait_for_results(self, run_id: str, headers: Dict) -> List[Dict]:
         """Wait for scraping to complete and return results"""
         
         status_url = f"{self.base_url}/actor-runs/{run_id}"
@@ -122,29 +93,28 @@ class ApifyInstagramScraper:
         
         # Poll for completion
         while True:
-            async with session.get(status_url, headers=headers) as response:
-                status_data = await response.json()
-                status = status_data["data"]["status"]
-                
-                if status == "SUCCEEDED":
-                    print("✅ Scraping completed successfully")
-                    break
-                elif status == "FAILED":
-                    raise HTTPException(status_code=500, detail="Scraping failed")
-                elif status in ["RUNNING", "READY"]:
-                    print(f"⏳ Status: {status}...")
-                    await asyncio.sleep(5)
-                else:
-                    print(f"🔄 Status: {status}")
-                    await asyncio.sleep(3)
+            response = requests.get(status_url, headers=headers)
+            status_data = response.json()
+            status = status_data["data"]["status"]
+            
+            if status == "SUCCEEDED":
+                print("✅ Scraping completed successfully")
+                break
+            elif status == "FAILED":
+                raise HTTPException(status_code=500, detail="Scraping failed")
+            elif status in ["RUNNING", "READY"]:
+                print(f"⏳ Status: {status}...")
+                time.sleep(5)
+            else:
+                print(f"🔄 Status: {status}")
+                time.sleep(3)
         
         # Get results
-        async with session.get(dataset_url, headers=headers) as response:
-            if response.status == 200:
-                return await response.json()
-            else:
-                error_text = await response.text()
-                raise HTTPException(status_code=500, detail=f"Failed to get results: {error_text}")
+        response = requests.get(dataset_url, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            raise HTTPException(status_code=500, detail=f"Failed to get results: {response.text}")
     
     def process_results(self, raw_results: List[Dict]) -> List[Dict]:
         """Process and clean the scraped results"""
@@ -191,7 +161,7 @@ def root():
     return {"status": "ok", "message": "Instagram Scraper API is running 🚀"}
 
 @app.post("/scrape_posts")
-async def scrape_posts_endpoint(payload: ScrapeRequest):
+def scrape_posts_endpoint(payload: ScrapeRequest):
     username = payload.username.lower().strip()
     
     # Get Apify token from environment
@@ -203,7 +173,7 @@ async def scrape_posts_endpoint(payload: ScrapeRequest):
     
     try:
         # Scrape posts using Apify
-        raw_posts = await scraper.scrape_user_posts(
+        raw_posts = scraper.scrape_user_posts(
             username=username,
             max_posts=20,
             include_comments=True
