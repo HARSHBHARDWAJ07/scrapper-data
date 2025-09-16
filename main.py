@@ -99,29 +99,34 @@ async def scrape_user_posts(username: str, max_posts: int = 30) -> List[Dict]:
             detail="Invalid username format. Username should contain only letters, numbers, dots, and underscores (1-30 characters)"
         )
 
+    # Build the Instagram URL from username
+    instagram_url = f"https://www.instagram.com/{username}/"
 
-
-
+    # Updated run_input based on working configuration
     run_input = {
-        "usernames": [username],
+        "directUrls": [instagram_url],  # Changed from usernames to directUrls
         "resultsType": "posts",
         "resultsLimit": max_posts,
         "searchType": "user",
         "searchLimit": 1,
-        "commentsLimit": 10,
-
-
-
-
-
-        "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
+        "addParentData": False,  # Added missing field
+        "enhanceUserSearchWithFacebookPage": False,  # Added missing field
+        "includeHasStories": False,  # Added missing field
+        "commentsLimit": 10,  # Keep existing comments limit
+        # Add the extendOutputFunction to properly extract hashtags
+        "extendOutputFunction": "($) => {\n  const caption = $.caption || \"\";\n  const hashtags = caption.match(/#\\w+/g) || [];\n  return {\n    postTitle: $.title || caption.split(\" \")[0] || \"\",\n    caption,\n    hashtags\n  };\n}",
+        "extendScraperFunction": "async ({ page, request, customData, Apify, signal, label }) => {}",
+        "customData": {},
+        "proxy": {
+            "useApifyProxy": True, 
+            "apifyProxyGroups": ["RESIDENTIAL"]
+        },
     }
 
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
             async with session.post(BASE_URL, json=run_input) as resp:
                 if resp.status != 200:
-
                     error_text = await resp.text()
                     raise HTTPException(
                         status_code=500, 
@@ -161,11 +166,18 @@ def process_results(raw_results: List[Dict]) -> List[Dict]:
         if not isinstance(post, dict):
             continue
             
+        # Use the hashtags from extendOutputFunction if available, otherwise fallback to original method
+        hashtags = post.get("hashtags", [])
+        if isinstance(hashtags, list):
+            hashtags_str = ", ".join([tag.replace('#', '') for tag in hashtags])
+        else:
+            # Fallback to original method
+            hashtags_str = ", ".join(post.get("hashtags", []))
 
         processed.append({
             "post_url": post.get("url", ""),
             "caption": post.get("caption", ""),
-            "hashtags": ", ".join(post.get("hashtags", [])),
+            "hashtags": hashtags_str,
             "top_comments": " | ".join([c.get("text", "") for c in post.get("latestComments", [])[:5] if isinstance(c, dict)])
         })
 
