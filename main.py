@@ -89,7 +89,7 @@ def handle_apify_response(response_data) -> List[Dict]:
 # SCRAPER
 # ----------------------------
 
-async def scrape_user_posts(username: str, max_posts: int = 30) -> List[Dict]:
+async def scrape_user_posts(username: str, max_posts: int = 3000) -> List[Dict]:
     """Scrape Instagram posts for a specific user from Apify actor"""
 
     # Validate username format
@@ -112,9 +112,9 @@ async def scrape_user_posts(username: str, max_posts: int = 30) -> List[Dict]:
         "addParentData": False,  # Added missing field
         "enhanceUserSearchWithFacebookPage": False,  # Added missing field
         "includeHasStories": False,  # Added missing field
-        "commentsLimit": 10,  # Keep existing comments limit
+        "commentsLimit": 0,  # Keep existing comments limit
         # Add the extendOutputFunction to properly extract hashtags
-        "extendOutputFunction": "($) => {\n  const caption = $.caption || \"\";\n  const hashtags = caption.match(/#\\w+/g) || [];\n  return {\n    postTitle: $.title || caption.split(\" \")[0] || \"\",\n    caption,\n    hashtags\n  };\n}",
+        "extendOutputFunction": "($) => {\n  const caption = $.caption || '';\n  const hashtags = caption.match(/#\\w+/g) || [];\n  return {\n    postTitle: $.title || caption.split(' ')[0] || '',\n    caption,\n    hashtags\n  };\n}",
         "extendScraperFunction": "async ({ page, request, customData, Apify, signal, label }) => {}",
         "customData": {},
         "proxy": {
